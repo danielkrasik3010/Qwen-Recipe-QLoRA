@@ -1,10 +1,15 @@
 """
-evaluate_qlora.py
-Evaluate a fine-tuned Qwen LoRA model on the recipe generation dataset.
+evaluate_qlora_ddp.py
+Evaluate a fine-tuned Qwen LoRA model trained with DDP on the recipe generation dataset.
+
+This script is specifically designed for evaluating models trained with train_qlora_ddp.py,
+which appends DDP-specific suffixes to model names (e.g., -DDP-4GPU).
 
 This script:
 1. Loads the base Qwen model with 4-bit quantization
 2. Attaches fine-tuned LoRA adapters (from Hugging Face Hub or local directory)
+   - Supports DDP naming convention: "Qwen2.5-1.5B-QLoRA-Recipe-DDP-4GPU-adapters"
+   - Checks DDP-specific local paths: "data/outputs/ddp_4gpu/{model_name}/lora_adapters"
 3. Evaluates on the recipe validation set
 4. Computes ROUGE metrics
 5. Saves predictions and results
@@ -68,15 +73,16 @@ print()
 # ---------------------------------------------------------------------------
 
 
-def evaluate_peft_model(cfg, adapter_source=None):
+def evaluate_peft_model(cfg, adapter_source=None, num_gpus=None):
     """
     Load base model, attach LoRA adapters from Hub or local, and evaluate on recipe dataset.
     
-    This function follows the same pattern as evaluate_baseline_check.ipynb but loads
-    fine-tuned LoRA adapters instead of using the base model.
+    This function is specifically designed for DDP-trained models from train_qlora_ddp.py.
+    It handles DDP-specific naming conventions and directory structures.
     
     Process:
     1. Determine adapter source (Hub or local) from config or argument
+       - If num_gpus is specified, appends -DDP-{num_gpus}GPU to model name
     2. Load base Qwen model with 4-bit quantization (using setup_model_and_tokenizer)
     3. Attach LoRA adapters (using PeftModel.from_pretrained)
     4. Load recipe validation dataset (using load_and_prepare_dataset)
@@ -88,10 +94,16 @@ def evaluate_peft_model(cfg, adapter_source=None):
         cfg (dict): Configuration dictionary loaded from config.yaml
                    Must contain: base_model, dataset, task_instruction, output_dir
         adapter_source (str, optional): 
-            - Hugging Face model ID: "username/Qwen2.5-1.5B-QLoRA-Recipe-adapters"
-            - Local path: "./outputs/lora_recipe/lora_adapters"
+            - Hugging Face model ID: "username/Qwen2.5-1.5B-QLoRA-Recipe-DDP-4GPU-adapters"
+            - Local path: "./outputs/ddp_4gpu/qwen2.5-1.5b-instruct/lora_adapters"
             - If None: Constructs from cfg["hub_model_name"] + HF_USERNAME env var
-                      or falls back to local output_dir
+                      with DDP suffix if num_gpus is specified
+        num_gpus (int, optional): Number of GPUs used for DDP training.
+                                 If specified, appends -DDP-{num_gpus}GPU to model name.
+                                 Examples:
+                                 - num_gpus=4 -> "Qwen2.5-1.5B-QLoRA-Recipe-DDP-4GPU"
+                                 - num_gpus=1 -> "Qwen2.5-1.5B-QLoRA-Recipe-1GPU"
+                                 - num_gpus=None -> "Qwen2.5-1.5B-QLoRA-Recipe" (no suffix)
     
     Returns:
         tuple: (scores_dict, predictions_list)
@@ -103,20 +115,44 @@ def evaluate_peft_model(cfg, adapter_source=None):
     # STEP 1: Determine Adapter Source (Hub or Local)
     # =======================================================================
     # This section determines where to load the LoRA adapters from.
-    # Priority: 1) adapter_source argument, 2) Hub (from config), 3) Local fallback
+    # Priority: 1) adapter_source argument, 2) Hub (from config with DDP suffix), 3) Local fallback
+    # For DDP models, checks DDP-specific directories: ddp_{n}gpu/{model_name}/lora_adapters
     
     if adapter_source is None:
         # Try to construct Hub model ID from config
         hf_username = os.getenv("HF_USERNAME")
         hub_model_name = cfg.get("hub_model_name")
         
+        # Add DDP suffix to model name if num_gpus is specified
+        if num_gpus is not None:
+            if hub_model_name:
+                if num_gpus > 1:
+                    # Append DDP info: e.g., "Qwen2.5-1.5B-QLoRA-Recipe" -> "Qwen2.5-1.5B-QLoRA-Recipe-DDP-4GPU"
+                    hub_model_name = f"{hub_model_name.strip()}-DDP-{num_gpus}GPU"
+                    print(f"📝 Using DDP model name: {hub_model_name}")
+                elif num_gpus == 1:
+                    # Single GPU: append baseline suffix
+                    hub_model_name = f"{hub_model_name.strip()}-1GPU"
+                    print(f"📝 Using single GPU model name: {hub_model_name}")
+        
         if hf_username and hub_model_name:
             # Construct Hub model ID: "username/model-name-adapters"
             adapter_source = f"{hf_username}/{hub_model_name}-adapters"
             print(f"📥 Using adapter from Hugging Face Hub: {adapter_source}")
         else:
-            # Fallback to local directory (same as train_qlora.py saves to)
-            output_dir = cfg.get("output_dir", os.path.join(OUTPUTS_DIR, "lora_recipe"))
+            # Fallback to local directory (check DDP-specific paths)
+            if num_gpus is not None:
+                # Use DDP-specific directory structure
+                model_name = cfg["base_model"].split("/")[-1].lower()
+                if num_gpus > 1:
+                    config_folder = f"ddp_{num_gpus}gpu"
+                else:
+                    config_folder = "baseline_1gpu"
+                output_dir = os.path.join(OUTPUTS_DIR, config_folder, model_name)
+            else:
+                # Fallback to default directory (same as train_qlora.py saves to)
+                output_dir = cfg.get("output_dir", os.path.join(OUTPUTS_DIR, "lora_recipe"))
+            
             adapter_source = os.path.join(output_dir, "lora_adapters")
             print(f"📁 Using adapter from local directory: {adapter_source}")
     
@@ -143,8 +179,8 @@ def evaluate_peft_model(cfg, adapter_source=None):
     # =======================================================================
     # Attach the fine-tuned LoRA adapters to the base model.
     # PeftModel.from_pretrained() can load from:
-    # - Hugging Face Hub: "username/model-name-adapters"
-    # - Local directory: "./outputs/lora_recipe/lora_adapters"
+    # - Hugging Face Hub: "username/model-name-DDP-4GPU-adapters"
+    # - Local directory: "./outputs/ddp_4gpu/qwen2.5-1.5b-instruct/lora_adapters"
     
     # Check if adapter_source is a Hub model ID or local path
     is_hub_model = (
@@ -164,15 +200,24 @@ def evaluate_peft_model(cfg, adapter_source=None):
         except Exception as e:
             print(f"❌ Error loading from Hub: {e}")
             print("   Falling back to local directory...")
-            # Fallback to local
-            output_dir = cfg.get("output_dir", os.path.join(OUTPUTS_DIR, "lora_recipe"))
+            # Fallback to local (try DDP-specific paths)
+            if num_gpus is not None:
+                model_name = cfg["base_model"].split("/")[-1].lower()
+                if num_gpus > 1:
+                    config_folder = f"ddp_{num_gpus}gpu"
+                else:
+                    config_folder = "baseline_1gpu"
+                output_dir = os.path.join(OUTPUTS_DIR, config_folder, model_name)
+            else:
+                output_dir = cfg.get("output_dir", os.path.join(OUTPUTS_DIR, "lora_recipe"))
+            
             adapter_source = os.path.join(output_dir, "lora_adapters")
             if not os.path.exists(adapter_source):
                 raise FileNotFoundError(
                     f"❌ LoRA adapter not found in Hub or locally:\n"
                     f"   Hub model: {adapter_source}\n"
                     f"   Local path: {adapter_source}\n"
-                    f"   Make sure you've pushed adapters to Hub or trained locally."
+                    f"   Make sure you've pushed adapters to Hub or trained locally with DDP."
                 )
             model = PeftModel.from_pretrained(model, adapter_source)
     else:
@@ -180,7 +225,8 @@ def evaluate_peft_model(cfg, adapter_source=None):
         if not os.path.exists(adapter_source):
             raise FileNotFoundError(
                 f"❌ LoRA adapter directory not found: {adapter_source}\n"
-                f"   Make sure you've trained the model first or provide a valid Hub model ID."
+                f"   Make sure you've trained the model first with train_qlora_ddp.py "
+                f"or provide a valid Hub model ID."
             )
         print(f"🔧 Loading LoRA adapters from local directory: {adapter_source}")
         model = PeftModel.from_pretrained(model, adapter_source)
@@ -285,7 +331,17 @@ def evaluate_peft_model(cfg, adapter_source=None):
     # Results file: Contains ROUGE scores and metadata
     # Predictions file: Contains full recipe format with NER, title, ingredients, directions
     
-    output_dir = cfg.get("output_dir", os.path.join(OUTPUTS_DIR, "lora_recipe"))
+    # Use DDP-specific output directory if num_gpus is specified
+    if num_gpus is not None:
+        model_name = cfg["base_model"].split("/")[-1].lower()
+        if num_gpus > 1:
+            config_folder = f"ddp_{num_gpus}gpu"
+        else:
+            config_folder = "baseline_1gpu"
+        output_dir = os.path.join(OUTPUTS_DIR, config_folder, model_name)
+    else:
+        output_dir = cfg.get("output_dir", os.path.join(OUTPUTS_DIR, "lora_recipe"))
+    
     os.makedirs(output_dir, exist_ok=True)
     
     results_path = os.path.join(output_dir, "eval_results.json")
@@ -300,6 +356,7 @@ def evaluate_peft_model(cfg, adapter_source=None):
         "base_model": cfg["base_model"],
         "adapter_source": adapter_source,
         "dataset": cfg["dataset"]["name"],
+        "num_gpus": num_gpus,  # Include DDP info in results
     }
     
     # Save results JSON
@@ -348,27 +405,41 @@ def evaluate_peft_model(cfg, adapter_source=None):
 
 def main():
     """
-    Main function to run evaluation.
+    Main function to run evaluation for DDP-trained models.
     
-    Supports command-line argument to specify adapter source:
-    - python evaluate_qlora.py
-    - python evaluate_qlora.py --adapter "username/Qwen2.5-1.5B-QLoRA-Recipe-adapters"
-    - python evaluate_qlora.py --adapter "./outputs/lora_recipe/lora_adapters"
+    Supports command-line arguments to specify adapter source and DDP configuration:
+    - python evaluate_qlora_ddp.py --num-gpus 4
+    - python evaluate_qlora_ddp.py --adapter "username/Qwen2.5-1.5B-QLoRA-Recipe-DDP-4GPU-adapters"
+    - python evaluate_qlora_ddp.py --adapter "./outputs/ddp_4gpu/qwen2.5-1.5b-instruct/lora_adapters" --num-gpus 4
     """
     import argparse
     
     # Parse command-line arguments
     parser = argparse.ArgumentParser(
-        description="Evaluate fine-tuned Qwen LoRA model on recipe generation dataset"
+        description="Evaluate fine-tuned Qwen LoRA model (DDP-trained) on recipe generation dataset"
     )
     parser.add_argument(
         "--adapter",
         type=str,
         default=None,
         help=(
-            "Adapter source: Hugging Face model ID (e.g., 'username/Qwen2.5-1.5B-QLoRA-Recipe-adapters') "
-            "or local path (e.g., './outputs/lora_recipe/lora_adapters'). "
-            "If not provided, will use config.yaml settings."
+            "Adapter source: Hugging Face model ID (e.g., 'username/Qwen2.5-1.5B-QLoRA-Recipe-DDP-4GPU-adapters') "
+            "or local path (e.g., './outputs/ddp_4gpu/qwen2.5-1.5b-instruct/lora_adapters'). "
+            "If not provided, will use config.yaml settings with DDP suffix if --num-gpus is specified."
+        ),
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help=(
+            "Number of GPUs used for DDP training. "
+            "If specified, will append -DDP-{num_gpus}GPU to model name from config.yaml. "
+            "Also checks DDP-specific local directories (e.g., 'data/outputs/ddp_4gpu/{model_name}/lora_adapters'). "
+            "Examples:\n"
+            "  --num-gpus 4 -> Loads 'Qwen2.5-1.5B-QLoRA-Recipe-DDP-4GPU-adapters'\n"
+            "  --num-gpus 1 -> Loads 'Qwen2.5-1.5B-QLoRA-Recipe-1GPU-adapters'\n"
+            "  (no flag)     -> Loads 'Qwen2.5-1.5B-QLoRA-Recipe-adapters' (no DDP suffix)"
         ),
     )
     args = parser.parse_args()
@@ -378,8 +449,8 @@ def main():
     print("📋 Loading configuration from config.yaml...")
     cfg = load_config()
     
-    # Run evaluation
-    scores, preds = evaluate_peft_model(cfg, adapter_source=args.adapter)
+    # Run evaluation with DDP support
+    scores, preds = evaluate_peft_model(cfg, adapter_source=args.adapter, num_gpus=args.num_gpus)
     
     # Display summary
     print("\n" + "="*60)
@@ -393,3 +464,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

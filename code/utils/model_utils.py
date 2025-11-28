@@ -14,7 +14,7 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 
 
 def setup_model_and_tokenizer(
-    cfg, use_4bit: bool = None, use_lora: bool = None, padding_side: str = "right"
+    cfg, use_4bit: bool = None, use_lora: bool = None, padding_side: str = "right", device_map=None
 ):
     """
     Load model, tokenizer, and apply quantization + LoRA config if specified.
@@ -27,6 +27,11 @@ def setup_model_and_tokenizer(
             - bf16 or fp16 precision
         use_4bit (bool, optional): Override whether to load in 4-bit mode.
         use_lora (bool, optional): Override whether to apply LoRA adapters.
+        padding_side (str): Tokenizer padding side ("left" or "right").
+        device_map (str, int, dict, optional): Device placement strategy.
+            - "auto": Automatic device placement (default for single GPU)
+            - int: Specific GPU device index (for DDP, use accelerator.local_process_index)
+            - None: Uses "auto" as default
 
     Returns:
         tuple: (model, tokenizer)
@@ -65,10 +70,25 @@ def setup_model_and_tokenizer(
     # ------------------------------
     # Model loading
     # ------------------------------
+    # Handle device_map for DDP (when device_map is an integer) vs single GPU (when "auto")
+    if device_map is None:
+        device_map = "auto"  # Default: automatic device placement
+    
+    # For DDP: if device_map is an integer, convert to dict format for bitsandbytes compatibility
+    # For 4-bit quantization with DDP, we use dict format: {"": device_index}
+    if isinstance(device_map, int):
+        # DDP mode: place model on specific GPU
+        # Use dict format for bitsandbytes compatibility: {"": device_index}
+        device_map_dict = {"": device_map}
+        print(f"🔧 DDP mode: Loading model on GPU {device_map}")
+        device_map = device_map_dict
+    elif device_map == "auto":
+        print("🔧 Auto device placement mode")
+    
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         quantization_config=quant_cfg,
-        device_map="auto",
+        device_map=device_map,
         dtype=(
             torch.bfloat16
             if cfg.get("bf16", True) and torch.cuda.is_available()
